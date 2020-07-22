@@ -4,11 +4,15 @@ os:
   - linux
 
 before_install:
-  - sudo apt-get install -y libev-dev libssl-dev
-  - git clone --recursive https://github.com/zhaojh329/libuwsc.git
-  - cd libuwsc && cmake . && sudo make install && cd -
+  - sudo apt-get install -y libev-dev libssl-dev libwolfssl-dev libmbedtls-dev
 
 script:
   - mkdir build && cd build
-  - cmake ..
+  - cmake .. -DRTTY_USE_OPENSSL=1
+  - make && sudo make install
+  - rm * -rf
+  - cmake .. -DRTTY_USE_WOLFSSL=1
+  - make && sudo make install
+  - rm * -rf
+  - cmake .. -DRTTY_USE_MBEDTLS=1
   - make && sudo make install

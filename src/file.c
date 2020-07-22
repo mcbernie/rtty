@@ -22,278 +22,380 @@
  * SOFTWARE.
  */
 
-#include <errno.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <string.h>
-#include <termios.h>
-#include <stdbool.h>
-#include <arpa/inet.h>
-#include <uwsc/log.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/statvfs.h>
+#include <mntent.h>
 
+#include "log.h"
 #include "file.h"
+#include "list.h"
+#include "rtty.h"
+#include "utils.h"
 
-static void set_stdin(bool raw)
+static uint8_t RTTY_FILE_MAGIC[] = {0xb6, 0xbc, 0xbd};
+static char abspath[PATH_MAX];
+static struct buffer b;
+
+static void notify_progress(struct file_context *ctx)
 {
-    static struct termios ots;
-    static bool current_raw;
-    struct termios nts;
+    struct rtty *rtty = container_of(ctx, struct rtty, file_context);
+    ev_tstamp now = ev_now(rtty->loop);
 
-    if (raw) {
-        if (current_raw)
-            return;
+    if (ctx->remain_size > 0 && now - ctx->last_notify_progress < 0.1)
+        return;
+    ctx->last_notify_progress = now;
 
-        current_raw = true;
+    buffer_truncate(&b, 0);
+    buffer_put_u8(&b, RTTY_FILE_MSG_PROGRESS);
+    buffer_put_u32(&b, ctx->remain_size);
+    buffer_put_u32(&b, ctx->total_size);
+    sendto(ctx->sock, buffer_data(&b), buffer_length(&b), 0,
+           (struct sockaddr *)&ctx->peer_sun, sizeof(struct sockaddr_un));
+}
 
-        tcgetattr(STDIN_FILENO, &ots);
+static void on_file_read(struct ev_loop *loop, struct ev_io *w, int revents)
+{
+    struct file_context *ctx = container_of(w, struct file_context, iof);
+    struct rtty *rtty = container_of(ctx, struct rtty, file_context);
+    uint8_t buf[4096];
+    int ret;
 
-        nts = ots;
+    if (buffer_length(&rtty->wb) > 4096)
+        return;
 
-        nts.c_iflag = IGNBRK;
-        /* No echo, crlf mapping, INTR, QUIT, delays, no erase/kill */
-        nts.c_lflag &= ~(ECHO | ICANON | ISIG);
-        nts.c_oflag = 0;
-        nts.c_cc[VMIN] = 1;
-        nts.c_cc[VTIME] = 1;
-        tcsetattr(STDIN_FILENO, TCSADRAIN, &nts);
-        fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL, 0) | O_NONBLOCK);
+    ret = read(w->fd, buf, sizeof(buf));
+    ctx->remain_size -= ret;
+
+    buffer_put_u8(&rtty->wb, MSG_TYPE_FILE);
+    buffer_put_u16be(&rtty->wb, 2 + ret);
+    buffer_put_u8(&rtty->wb, ctx->sid);
+    buffer_put_u8(&rtty->wb, RTTY_FILE_MSG_DATA);
+    buffer_put_data(&rtty->wb, buf, ret);
+    ev_io_start(rtty->loop, &rtty->iow);
+
+    if (ret == 0) {
+        ctx->busy = false;
+        ev_io_stop(loop, w);
+        close(ctx->fd);
+        ctx->fd = -1;
     } else {
-        if (!current_raw)
-            return;
-        current_raw = false;
-        tcsetattr(STDIN_FILENO, TCSADRAIN, &ots);
-        fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL, 0) & ~O_NONBLOCK);
+        notify_progress(ctx);
     }
 }
 
-static void rf_write(int fd, void *buf, int len)
+static void start_upload_file(struct file_context *ctx, struct buffer *info)
 {
-    if (write(fd, buf, len) < 0) {
-        uwsc_log_err("Write failed: %s\n", strerror(errno));
-        exit(0);
+    struct rtty *rtty = container_of(ctx, struct rtty, file_context);
+    uint32_t size = buffer_pull_u32(info);
+    const char *path = buffer_data(info);
+    const char *name = basename(path);
+    int fd;
+
+    fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        log_err("open '%s' fail\n", path, strerror(errno));
+        return;
+    }
+
+    buffer_put_u8(&rtty->wb, MSG_TYPE_FILE);
+    buffer_put_u16be(&rtty->wb, 2 + strlen(name));
+    buffer_put_u8(&rtty->wb, ctx->sid);
+    buffer_put_u8(&rtty->wb, RTTY_FILE_MSG_INFO);
+    buffer_put_string(&rtty->wb, name);
+    ev_io_start(rtty->loop, &rtty->iow);
+
+    ev_io_init(&ctx->iof, on_file_read, fd, EV_READ);
+    ev_io_start(rtty->loop, &ctx->iof);
+
+    ctx->fd = fd;
+    ctx->total_size = size;
+    ctx->remain_size = size;
+
+    log_info("upload file: %s\n", path);
+}
+
+static void send_canceled_msg(struct rtty *rtty)
+{
+    buffer_put_u8(&rtty->wb, MSG_TYPE_FILE);
+    buffer_put_u16be(&rtty->wb, 2);
+    buffer_put_u8(&rtty->wb, rtty->file_context.sid);
+    buffer_put_u8(&rtty->wb, RTTY_FILE_MSG_CANCELED);
+    ev_io_start(rtty->loop, &rtty->iow);
+}
+
+static void start_download_file(struct file_context *ctx, struct buffer *info, int len)
+{
+    struct rtty *rtty = container_of(ctx, struct rtty, file_context);
+    struct mntent *ment;
+    struct statvfs sfs;
+    char *name;
+    int fd;
+
+    ctx->total_size = ctx->remain_size = buffer_pull_u32be(info);
+    name = strndup(buffer_data(info), len - 4);
+    buffer_pull(info, NULL, len - 4);
+
+    ment = find_mount_point(abspath);
+    if (ment) {
+        if (statvfs(ment->mnt_dir, &sfs) == 0 && ctx->total_size > sfs.f_bavail * sfs.f_frsize) {
+            int type = RTTY_FILE_MSG_NO_SPACE;
+
+            send_canceled_msg(rtty);
+            sendto(ctx->sock, &type, 1, 0, (struct sockaddr *) &ctx->peer_sun, sizeof(struct sockaddr_un));
+            log_err("download file fail: no enough space\n");
+            return;
+        }
+    }
+
+    strcat(abspath, name);
+
+    fd = open(abspath, O_WRONLY | O_TRUNC | O_CREAT, 0644);
+    if (fd < 0) {
+        log_err("create file '%s' fail: %s\n", name, strerror(errno));
+        return;
+    }
+
+    ctx->fd = fd;
+
+    log_info("download file: %s, size: %u\n", abspath, ctx->total_size);
+
+    buffer_truncate(&b, 0);
+    buffer_put_u8(&b, RTTY_FILE_MSG_INFO);
+    buffer_put_string(&b, name);
+    buffer_put_zero(&b, 1);
+    sendto(ctx->sock, buffer_data(&b), buffer_length(&b), 0,
+           (struct sockaddr *)&ctx->peer_sun, sizeof(struct sockaddr_un));
+    free(name);
+}
+
+static void notify_busy(struct file_context *ctx)
+{
+    int type = RTTY_FILE_MSG_BUSY;
+
+    log_err("upload file is busy\n");
+    sendto(ctx->sock, &type, 1, 0,
+           (struct sockaddr *)&ctx->peer_sun, sizeof(struct sockaddr_un));
+}
+
+static void on_socket_read(struct ev_loop *loop, struct ev_io *w, int revents)
+{
+    struct file_context *ctx = container_of(w, struct file_context, ios);
+    struct rtty *rtty = container_of(ctx, struct rtty, file_context);
+    int type = read_file_msg(w->fd, &b);
+
+    switch (type) {
+    case RTTY_FILE_MSG_INFO:
+        start_upload_file(ctx, &b);
+        break;
+    case RTTY_FILE_MSG_CANCELED:
+        if (ctx->fd > -1) {
+            close(ctx->fd);
+            ctx->fd = -1;
+            ev_io_stop(loop, &ctx->iof);
+        }
+
+        ctx->busy = false;
+        send_canceled_msg(rtty);
+        break;
+    case RTTY_FILE_MSG_SAVE_PATH:
+        strcpy(abspath, buffer_data(&b));
+        strcat(abspath, "/");
+        buffer_put_u8(&rtty->wb, MSG_TYPE_FILE);
+        buffer_put_u16be(&rtty->wb, 2);
+        buffer_put_u8(&rtty->wb, ctx->sid);
+        buffer_put_u8(&rtty->wb, RTTY_FILE_MSG_START_DOWNLOAD);
+        ev_io_start(loop, &rtty->iow);
+        break;
+    default:
+        break;
     }
 }
 
-static bool parse_file_info(struct transfer_context *tc)
+int start_file_service(struct file_context *ctx)
 {
-    struct buffer *b = &tc->b;
-    int len;
+    struct rtty *rtty = container_of(ctx, struct rtty, file_context);
+    struct sockaddr_un sun = {
+        .sun_family = AF_UNIX
+    };
+    int sock;
 
-    if (buffer_length(b) < 3)
-        return false;
+    if (strlen(RTTY_FILE_UNIX_SOCKET_S) >= sizeof(sun.sun_path)) {
+        log_err("unix socket path too long\n");
+        return -1;
+    }
 
-    len = buffer_get_u8(b, 1);
+    sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (sock < 0) {
+        log_err("create socket fail: %s\n", strerror(errno));
+        return -1;
+    }
 
-    if (buffer_length(b) < len + 2)
-        return false;
+    strcpy(sun.sun_path, RTTY_FILE_UNIX_SOCKET_S);
 
-    buffer_pull(b, NULL, 2);
-    buffer_pull(b, tc->name, len);
+    unlink(RTTY_FILE_UNIX_SOCKET_S);
 
-    tc->size = ntohl(buffer_pull_u32(b));
+    if (bind(sock, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
+        log_err("bind socket fail: %s\n", strerror(errno));
+        goto err;
+    }
 
-    return true;
+    ev_io_init(&ctx->ios, on_socket_read, sock, EV_READ);
+    ev_io_start(rtty->loop, &ctx->ios);
+
+    ctx->fd = -1;
+    ctx->sock = sock;
+    ctx->peer_sun.sun_family = AF_UNIX;
+    strcpy(ctx->peer_sun.sun_path, RTTY_FILE_UNIX_SOCKET_C);
+
+    return sock;
+
+err:
+    if (sock > -1)
+        close(sock);
+    return -1;
 }
 
-static bool parse_file_data(struct transfer_context *tc)
+void parse_file_msg(struct file_context *ctx, int type, struct buffer *data, int len)
 {
-    struct buffer *b = &tc->b;
-    ev_tstamp n = ev_time();
-    char unit = 'K';
-    float offset;
-    int len;
+    switch (type) {
+    case RTTY_FILE_MSG_INFO:
+        start_download_file(ctx, data, len);
+        break;
+    case RTTY_FILE_MSG_DATA:
+        if (len == 0) {
+            close(ctx->fd);
+            ctx->fd = -1;
+            ctx->busy = false;
+            return;
+        }
+        if (ctx->fd > -1) {
+            buffer_pull_to_fd(data, ctx->fd, len);
+            ctx->remain_size -= len;
+            notify_progress(ctx);
+        } else {
+            buffer_pull(data, NULL, len);
+        }
+        break;
+    case RTTY_FILE_MSG_CANCELED:
+        if (ctx->fd > -1)
+            close(ctx->fd);
+        ctx->fd = -1;
+        ctx->busy = false;
+        sendto(ctx->sock, &type, 1, 0, (struct sockaddr *) &ctx->peer_sun, sizeof(struct sockaddr_un));
+        break;
+    default:
+        break;
+    }
+}
 
-    if (buffer_length(b) < 3)
+int connect_rtty_file_service()
+{
+    struct sockaddr_un sun = { .sun_family = AF_UNIX };
+    int sock = -1;
+
+    sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (sock < 0) {
+        fprintf(stderr, "create socket fail: %s\n", strerror(errno));
+        return -1;
+    }
+
+    strcpy(sun.sun_path, RTTY_FILE_UNIX_SOCKET_C);
+
+    unlink(RTTY_FILE_UNIX_SOCKET_C);
+
+    if (bind(sock, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
+        log_err("bind socket fail: %s\n", strerror(errno));
+        goto err;
+    }
+
+    strcpy(sun.sun_path, RTTY_FILE_UNIX_SOCKET_S);
+
+    if (connect(sock, (struct sockaddr *) &sun, sizeof(sun)) < 0) {
+        fprintf(stderr, "connect to rtty fail: %s\n", strerror(errno));
+        goto err;
+    }
+
+    return sock;
+
+err:
+    if (sock > -1)
+        close(sock);
+    return -1;
+}
+
+void request_transfer_file()
+{
+    fwrite(RTTY_FILE_MAGIC, sizeof(RTTY_FILE_MAGIC), 1, stdout);
+    fflush(stdout);
+    usleep(10000);
+}
+
+static void accept_file_request(struct file_context *ctx)
+{
+    int type = RTTY_FILE_MSG_REQUEST_ACCEPT;
+
+    ctx->fd = -1;
+    ctx->busy = true;
+    ctx->last_notify_progress = 0;
+    sendto(ctx->sock, &type, 1, 0,
+           (struct sockaddr *)&ctx->peer_sun, sizeof(struct sockaddr_un));
+}
+
+bool detect_file_operation(uint8_t *buf, int len, int sid, struct file_context *ctx)
+{
+    if (len != 3)
         return false;
 
-    len = ntohs(buffer_get_u16(b, 1));
-
-    if (buffer_length(b) < len + 3)
+    if (memcmp(buf, RTTY_FILE_MAGIC, sizeof(RTTY_FILE_MAGIC)))
         return false;
 
-    buffer_pull(b, NULL, 3);
+    ctx->sid = sid;
 
-    if (tc->fd > 0) {
-        buffer_pull_to_fd(b, tc->fd, len, NULL, NULL);
-    } else {
-        /* skip */
-        buffer_pull(b, NULL, len);
+    if (ctx->busy) {
+        notify_busy(ctx);
         return true;
     }
 
-    tc->offset += len;
-    offset = tc->offset / 1024.0;
-
-    if ((int)offset / 1024 > 0) {
-        offset = offset / 1024;
-        unit = 'M';
-    }
-
-    printf("  %d%%   %.3f %cB    %.3fs\r",
-        (int)(tc->offset * 1.0 / tc->size * 100), offset, unit, n - tc->ts);
-    fflush(stdout);
+    accept_file_request(ctx);
 
     return true;
 }
 
-static int parse_file(struct transfer_context *tc)
+void update_progress(struct ev_loop *loop, ev_tstamp start_time, struct buffer *info)
 {
-    struct buffer *b = &tc->b;
-    int type;
+    uint32_t remain = buffer_pull_u32(info);
+    uint32_t total = buffer_pull_u32(info);
 
-    while (buffer_length(b) > 0) {
-        type = buffer_get_u8(b, 0);
+    printf("%100c\r", ' ');
+    printf("  %lu%%    %s     %.3lfs\r", (total - remain) * 100UL / total,
+           format_size(total - remain), ev_now(loop) - start_time);
+    fflush(stdout);
 
-        switch (type) {
-        case 0x01:  /* file info */
-            if (!parse_file_info(tc))
-                return false;
-
-            tc->ts = ev_time();
-
-            printf("Transferring '%s'...\r\n", tc->name);
-
-            tc->fd = open(tc->name, O_WRONLY | O_TRUNC | O_CREAT, 0644);
-            if (tc->fd < 0) {
-                char magic_err[] = {0xB6, 0xBC, 'e'};
-                printf("Create '%s' failed: %s\r\n", tc->name, strerror(errno));
-
-                usleep(1000);
-
-                rf_write(STDOUT_FILENO, magic_err, 3);
-            }
-
-            break;
-        case 0x02:  /* file data */
-            if (!parse_file_data(tc))
-                return false;
-            break;
-        case 0x03:  /* file eof */
-            if (tc->fd > 0) {
-                close(tc->fd);
-                tc->fd = -1;
-
-                if (tc->mode == RF_RECV)
-                    printf("\r\n");
-            }
-            return true;
-        default:
-            printf("error type\r\n");
-            exit(1);
-        }
-    }
-
-    return false;
-}
-
-static void stdin_read_cb(struct ev_loop *loop, struct ev_io *w, int revents)
-{
-    struct transfer_context *tc = w->data;
-    bool eof = false;
-
-    buffer_put_fd(&tc->b, w->fd, -1, &eof, NULL, NULL);
-
-    if (parse_file(tc))
-        ev_io_stop(loop, w);
-}
-
-static void timer_cb(struct ev_loop *loop, ev_timer *w, int revents)
-{
-    struct transfer_context *tc = w->data;
-    static uint8_t buf[RF_BLK_SIZE + 3];
-    int len;
-
-    /* Canceled by user */
-    if (tc->fd < 0) {
-        buf[0] = 0x03;
-        rf_write(STDOUT_FILENO, buf, 1);
+    if (remain == 0) {
         ev_break(loop, EVBREAK_ALL);
-        return;
+        puts("");
     }
-
-    len = read(tc->fd, buf + 3, RF_BLK_SIZE);
-    if (len == 0) {
-        buf[0] = 0x03;
-        rf_write(STDOUT_FILENO, buf, 1);
-        ev_break(loop, EVBREAK_ALL);
-        return;
-    }
-
-    buf[0] = 0x02;
-    *(uint16_t *)&buf[1] = htons(len);
-    
-    rf_write(STDOUT_FILENO, buf, len + 3);
 }
 
-void transfer_file(const char *name)
+void cancel_file_operation(struct ev_loop *loop, int sock)
 {
-    struct ev_loop *loop = EV_DEFAULT;
-    char magic[3] = {0xB6, 0xBC};
-    struct transfer_context tc = {};
-    const char *bname = "";
-    struct ev_timer t;
-    struct ev_io w;
-
-    if (name) {
-        struct stat st;
-
-        bname = basename(name);
-        magic[2] = tc.mode = RF_SEND;
-
-        printf("Transferring '%s'...Press Ctrl+C to cancel\r\n", bname);
-
-        tc.fd = open(name, O_RDONLY);
-        if (tc.fd < 0) {
-            if (errno == ENOENT) {
-                printf("Open '%s' failed: No such file\r\n", name);
-                exit(0);
-            }
-
-            printf("Open '%s' failed: %s\r\n", name, strerror(errno));
-            exit(0);
-        }
-
-        fstat(tc.fd, &st);
-        tc.size = st.st_size;
-
-        if (!(st.st_mode & S_IFREG)) {
-            printf("'%s' is not a regular file\r\n", name);
-            exit(0);
-        }
-    } else {
-        magic[2] = tc.mode = RF_RECV;
-
-        printf("rtty waiting to receive. Press Ctrl+C to cancel\n");
-    }
-
-    set_stdin(true);
-
-    ev_io_init(&w, stdin_read_cb, STDIN_FILENO, EV_READ);
-    ev_io_start(loop, &w);
-    w.data = &tc;
-
-    rf_write(STDOUT_FILENO, magic, 3);
-
-    if (tc.mode == RF_SEND) {
-        uint8_t info[512] = {0x01};
-
-        ev_timer_init(&t, timer_cb, 0.01, 0.01);
-	    ev_timer_start(loop, &t);
-        t.data = &tc;
-
-        info[1] = strlen(bname);
-        memcpy(info + 2, bname, strlen(bname));
-        *(uint32_t *)&info[2 + strlen(bname)] = htonl(tc.size);
-
-        rf_write(STDOUT_FILENO, info, 6 + strlen(bname));
-    }
-
-    ev_run(loop, 0);
-
-    set_stdin(false);
-
-    exit(0);
+    int type = RTTY_FILE_MSG_CANCELED;
+    send(sock, &type, 1, 0);;
+    ev_break(loop, EVBREAK_ALL);
+    puts("");
 }
 
+int read_file_msg(int sock, struct buffer *out)
+{
+    uint8_t buf[1024];
+    int ret = read(sock, buf, sizeof(buf));
+    buffer_truncate(out, 0);
+    buffer_put_data(out, buf, ret);
+    return buffer_pull_u8(out);
+}

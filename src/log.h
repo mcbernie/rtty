@@ -22,53 +22,24 @@
  * SOFTWARE.
  */
 
-#ifndef RTTY_FILE_H
-#define RTTY_FILE_H
+#ifndef _LOG_H
+#define _LOG_H
 
-#include <ev.h>
-#include <sys/un.h>
+#include <syslog.h>
+#include <string.h>
 
-#include "buffer.h"
+void set_log_threshold(int threshold);
 
-enum {
-    RTTY_FILE_MSG_START_DOWNLOAD,
-    RTTY_FILE_MSG_INFO,
-    RTTY_FILE_MSG_DATA,
-    RTTY_FILE_MSG_CANCELED,
-    RTTY_FILE_MSG_BUSY,
-    RTTY_FILE_MSG_PROGRESS,
-    RTTY_FILE_MSG_REQUEST_ACCEPT,
-    RTTY_FILE_MSG_SAVE_PATH,
-    RTTY_FILE_MSG_NO_SPACE
-};
+void log_close();
 
-struct file_context {
-    int sid;
-    int fd;
-    int sock;
-    bool busy;
-    uint32_t total_size;
-    uint32_t remain_size;
-    struct sockaddr_un peer_sun;
-    struct ev_io ios;  /* used for unix socket */
-    struct ev_io iof;  /* used for upload file */
-    ev_tstamp last_notify_progress;
-};
+#define __FILENAME__ (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 
-int start_file_service(struct file_context *ctx);
+#define log(priority, fmt...) __ilog(__FILENAME__, __LINE__, priority, fmt)
 
-void parse_file_msg(struct file_context *ctx, int type, struct buffer *data, int len);
+#define log_debug(fmt...)     log(LOG_DEBUG, fmt)
+#define log_info(fmt...)      log(LOG_INFO, fmt)
+#define log_err(fmt...)       log(LOG_ERR, fmt)
 
-void update_progress(struct ev_loop *loop, ev_tstamp start_time, struct buffer *info);
-
-void cancel_file_operation(struct ev_loop *loop, int sock);
-
-int read_file_msg(int sock, struct buffer *out);
-
-int connect_rtty_file_service();
-
-void request_transfer_file();
-bool detect_file_operation(uint8_t *buf, int len, int sid, struct file_context *ctx);
+void __ilog(const char *filename, int line, int priority, const char *fmt, ...);
 
 #endif
-
